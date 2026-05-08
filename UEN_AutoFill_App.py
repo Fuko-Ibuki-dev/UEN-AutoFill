@@ -52,6 +52,10 @@ html, body, [class*="css"] { font-family: 'DM Sans', sans-serif; }
 .warn-box { background:#FFF8EC; border-left:3px solid #F5A623; border-radius:0 8px 8px 0; padding:0.75rem 1rem; font-size:0.85rem; color:#7A5500; margin-bottom:0; }
 .dl-section { background:#F7F6F2; border:1px solid #E8E6DF; border-radius:10px; padding:1.2rem 1.4rem; margin-top:1rem; }
 .dl-section-title { font-size:0.78rem; font-weight:600; letter-spacing:0.8px; text-transform:uppercase; color:#9A9A9A; margin-bottom:0.8rem; }
+.legend-row { display:flex; gap:0.75rem; flex-wrap:wrap; font-size:0.8rem; margin-top:0.6rem; margin-bottom:0.2rem; }
+.legend-chip { padding:0.2rem 0.7rem; border-radius:4px; font-weight:500; }
+.legend-filled   { background:#FFF3CD; border:1px solid #F5C842; color:#7A5500; }
+.legend-replaced { background:#FFE0D0; border:1px solid #E8855A; color:#7A2800; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -71,6 +75,10 @@ DB_PATHS = [
     "./database_3.db",
     "./database_4.db",
 ]
+
+# Highlight fill colours applied to script-written UEN cells
+FILL_FILLED   = PatternFill("solid", fgColor="FFF3CD")   # amber-yellow  — was empty, now filled
+FILL_REPLACED = PatternFill("solid", fgColor="FFE0D0")   # soft coral    — was invalid/wrong, now replaced
 
 # ─── HELPERS ──────────────────────────────────────────────────────────────────
 def is_na(value: str) -> bool:
@@ -111,21 +119,12 @@ def clean_val(v) -> str:
     return "" if s in ("nan","None","<NA>","NaN") else s
 
 def clear_session_data():
-    for key in ["processed_df","stats","preview_two_col"]:
+    for key in ["processed_df","stats","script_rows","preview_two_col"]:
         st.session_state.pop(key, None)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  FTS5 SETUP
-#
-#  The FTS5 table indexes both company_name AND aliases so that tier-5 FTS5
-#  queries can match on alias text too (e.g. a query of "IHRP" will match
-#  the aliases column even when no company_name contains "IHRP").
-#
-#  uen is stored UNINDEXED — we only need it for retrieval, not searching.
-#
-#  If a previous version of the table was built without the aliases column,
-#  ensure_fts5 drops and rebuilds it automatically on first startup.
 # ═══════════════════════════════════════════════════════════════════════════════
 def ensure_fts5(db_path: str) -> None:
     conn = sqlite3.connect(db_path)
@@ -138,7 +137,6 @@ def ensure_fts5(db_path: str) -> None:
     if row is None:
         needs_build = True
     elif row[0] and "aliases" not in row[0]:
-        # Old table missing aliases column — drop and rebuild
         conn.execute("DROP TABLE IF EXISTS companies_fts")
         conn.commit()
         needs_build = True
@@ -164,15 +162,6 @@ def ensure_fts5(db_path: str) -> None:
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  INDEX BUILD
-#
-#  Memory structures:
-#    exact        dict  norm_name  -> uen    tier-1  O(1) exact name
-#    alias_exact  dict  norm_alias -> uen    tier-2  O(1) exact alias  ← checked
-#                                            immediately after tier-1 so short
-#                                            alias-only names are never missed
-#    fw_index     dict  first_word -> [(norm_name, uen, alias_norms_tuple)]
-#                                            tier-3/4 substring scan
-#    fts_conns    list  open read-only connections  tier-5 FTS5 fallback
 # ═══════════════════════════════════════════════════════════════════════════════
 @st.cache_resource(show_spinner="Loading reference database…")
 def build_indexes(db_paths: tuple):
@@ -211,10 +200,8 @@ def build_indexes(db_paths: tuple):
                 continue
             seen.add(norm_name)
 
-            # tier-1
             exact[norm_name] = uen
 
-            # alias structures
             alias_norms = ()
             if alias_raw:
                 parts = []
@@ -229,7 +216,6 @@ def build_indexes(db_paths: tuple):
                             alias_exact[na] = uen
                 alias_norms = tuple(parts)
 
-            # fw_index: bucket by first word + additional meaningful words
             words = norm_name.split()
             if not words:
                 continue
@@ -242,9 +228,7 @@ def build_indexes(db_paths: tuple):
     return exact, dict(fw_index), alias_exact, fts_conns, len(exact)
 
 
-# ─── FTS5 LOOKUP  (tier-5 fallback) ──────────────────────────────────────────
-# Searches the full FTS5 table — which indexes both company_name and aliases —
-# so alias-only matches (e.g. "IHRP") are also caught here as a safety net.
+# ─── FTS5 LOOKUP ──────────────────────────────────────────────────────────────
 def fts_lookup(norm_query: str, fts_conns: list) -> str:
     tokens = meaningful_tokens(norm_query)
     if not tokens or not fts_conns:
@@ -252,7 +236,6 @@ def fts_lookup(norm_query: str, fts_conns: list) -> str:
     fts_q = " AND ".join(f'"{t}"' for t in tokens)
     for conn in fts_conns:
         try:
-            # Querying the table name (not a column) searches ALL indexed columns
             row = conn.execute(
                 "SELECT uen FROM companies_fts WHERE companies_fts MATCH ? LIMIT 1",
                 (fts_q,)
@@ -265,19 +248,6 @@ def fts_lookup(norm_query: str, fts_conns: list) -> str:
 
 
 # ─── FIND UEN ─────────────────────────────────────────────────────────────────
-#
-# Tier 1  exact name dict              O(1)
-# Tier 2  exact alias dict             O(1)   ← checked right after tier-1.
-#                                              Previously this was checked only
-#                                              after fw_index scanning, causing
-#                                              alias-only queries (e.g. "IHRP")
-#                                              to fall all the way to FTS5 and
-#                                              still miss (old FTS5 had no
-#                                              aliases column).  Now fixed.
-# Tier 3  fw_index name substring      O(1) bucket + small list scan
-# Tier 4  fw_index alias substring     same loop as tier-3 (no extra pass)
-# Tier 5  FTS5 on-disk                 O(log N), searches name + aliases
-
 def find_uen(typed_name: str,
              exact: dict, fw_index: dict, alias_exact: dict,
              fts_conns: list) -> str:
@@ -286,21 +256,15 @@ def find_uen(typed_name: str,
     if not norm_query:
         return ""
 
-    # ── Tier 1: exact name ───────────────────────────────────────────────────
     if norm_query in exact:
         return exact[norm_query]
 
-    # ── Tier 2: exact alias ──────────────────────────────────────────────────
-    # Must be checked here — before fw_index — so that a query which IS an alias
-    # but is NOT a substring of any official name (e.g. "IHRP") is caught at
-    # O(1) cost rather than falling through all tiers and being missed.
     if norm_query in alias_exact:
         return alias_exact[norm_query]
 
     nq_len = len(norm_query)
     best_uen, best_score = "", -1
 
-    # ── Tiers 3 + 4: fw_index substring scan ─────────────────────────────────
     seen_cands: dict[str, tuple] = {}
     for w in norm_query.split():
         if w in fw_index:
@@ -312,7 +276,6 @@ def find_uen(typed_name: str,
     for norm_name, uen, alias_norms in seen_cands.values():
         en_len = len(norm_name)
 
-        # Tier 3: official name substring with ratio guard
         if nq_len <= en_len:
             sl, ratio, hit = nq_len, nq_len / en_len, norm_query in norm_name
         else:
@@ -321,9 +284,8 @@ def find_uen(typed_name: str,
             score = 5000 + sl
             if score > best_score:
                 best_score, best_uen = score, uen
-            continue  # skip alias check for this entry — name match is better
+            continue
 
-        # Tier 4: alias substring
         for alias in alias_norms:
             al_len = len(alias)
             if nq_len <= al_len:
@@ -339,7 +301,6 @@ def find_uen(typed_name: str,
     if best_score >= 4000:
         return best_uen
 
-    # ── Tier 5: FTS5 on-disk ─────────────────────────────────────────────────
     fts_result = fts_lookup(norm_query, fts_conns)
     if fts_result:
         return fts_result
@@ -353,6 +314,10 @@ def process_df(df, name_col_idx, uen_col_idx, header_row_idx, end_row_1based,
 
     result_df  = df.copy()
     filled = replaced = already = na_count = no_match = 0
+
+    # Maps row index -> "filled" or "replaced" for every cell the script wrote
+    script_rows: dict[int, str] = {}
+
     data_start = header_row_idx + 1
     data_end   = (end_row_1based - 1) if end_row_1based > 0 else (len(df) - 1)
     nc = df.columns[name_col_idx]
@@ -391,18 +356,36 @@ def process_df(df, name_col_idx, uen_col_idx, header_row_idx, end_row_1based,
 
         # Name pasted into UEN column → look up
         if tn.lower() == tu.lower():
-            m = cached_find(tn); result_df.at[i, uc] = m
-            replaced += bool(m); no_match += not bool(m); continue
+            m = cached_find(tn)
+            result_df.at[i, uc] = m
+            if m:
+                script_rows[i] = "replaced"
+                replaced += 1
+            else:
+                no_match += 1
+            continue
 
         # UEN is a placeholder → look up
         if is_na(tu):
-            m = cached_find(tn); result_df.at[i, uc] = m
-            filled += bool(m); no_match += not bool(m); continue
+            m = cached_find(tn)
+            result_df.at[i, uc] = m
+            if m:
+                script_rows[i] = "filled"
+                filled += 1
+            else:
+                no_match += 1
+            continue
 
         # UEN fails format check → replace
         if tu and not is_valid_uen(tu):
-            m = cached_find(tn); result_df.at[i, uc] = m
-            replaced += bool(m); no_match += not bool(m); continue
+            m = cached_find(tn)
+            result_df.at[i, uc] = m
+            if m:
+                script_rows[i] = "replaced"
+                replaced += 1
+            else:
+                no_match += 1
+            continue
 
         # Valid UEN present → keep (normalise to uppercase)
         if tu and is_valid_uen(tu):
@@ -412,30 +395,47 @@ def process_df(df, name_col_idx, uen_col_idx, header_row_idx, end_row_1based,
             already += 1; continue
 
         # UEN empty → look up
-        m = cached_find(tn); result_df.at[i, uc] = m
-        filled += bool(m); no_match += not bool(m)
+        m = cached_find(tn)
+        result_df.at[i, uc] = m
+        if m:
+            script_rows[i] = "filled"
+            filled += 1
+        else:
+            no_match += 1
 
     return result_df, {"filled":filled,"replaced":replaced,"already":already,
-                       "na":na_count,"no_match":no_match}
+                       "na":na_count,"no_match":no_match}, script_rows
 
 
 # ─── EXCEL BUILDERS ───────────────────────────────────────────────────────────
-def build_full_excel(df):
+def build_full_excel(df, uen_col_idx: int, script_rows: dict):
+    """Full sheet export. UEN cells written by the script are highlighted."""
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as w:
         df.to_excel(w, index=False, header=False)
+        ws = w.sheets["Sheet1"]
+        uen_excel_col = uen_col_idx + 1          # openpyxl is 1-based
+        for row_idx, kind in script_rows.items():
+            excel_row = row_idx + 1              # openpyxl rows are 1-based
+            fill = FILL_FILLED if kind == "filled" else FILL_REPLACED
+            ws.cell(row=excel_row, column=uen_excel_col).fill = fill
     return buf.getvalue()
 
-def build_uen_only_excel(df, name_col_idx, uen_col_idx, header_row_idx):
+
+def build_uen_only_excel(df, name_col_idx, uen_col_idx, header_row_idx, script_rows: dict):
+    """Stripped Name + UEN sheet. Script-written UEN cells are highlighted."""
     out_df = df.copy().fillna("").replace({"nan":"","None":"","<NA>":""})
     hdr_name = clean_val(out_df.iloc[header_row_idx, name_col_idx]) or "Company Name"
     hdr_uen  = clean_val(out_df.iloc[header_row_idx, uen_col_idx])  or "UEN"
+
+    # Collect (name, uen, original_row_index) so we can map highlights back
     data_rows = []
     for i in range(header_row_idx + 1, len(out_df)):
         nv = clean_val(out_df.iloc[i, name_col_idx])
         uv = clean_val(out_df.iloc[i, uen_col_idx])
-        if nv == "NA" and uv == "NA": continue
-        data_rows.append((nv, uv))
+        if nv == "NA" and uv == "NA":
+            continue
+        data_rows.append((nv, uv, i))           # keep original index
 
     wb = Workbook(); ws = wb.active; ws.title = "UEN Results"
     hf    = Font(bold=True, color="F7F6F2", name="Arial", size=10)
@@ -451,12 +451,24 @@ def build_uen_only_excel(df, name_col_idx, uen_col_idx, header_row_idx):
     wht = PatternFill("solid", fgColor="FFFFFF")
     df_ = Font(name="Arial", size=10)
     uf  = Font(name="Courier New", size=10, color="1A6E3F")
-    for rn, (nv, uv) in enumerate(data_rows, start=2):
+
+    for excel_rn, (nv, uv, orig_i) in enumerate(data_rows, start=2):
         ws.append([nv, uv])
-        fill = alt if rn % 2 == 0 else wht
-        ws.cell(rn,1).font = df_; ws.cell(rn,1).fill = fill
-        ws.cell(rn,2).font = uf;  ws.cell(rn,2).fill = fill
-        ws.row_dimensions[rn].height = 18
+        base_fill = alt if excel_rn % 2 == 0 else wht
+
+        ws.cell(excel_rn, 1).font = df_
+        ws.cell(excel_rn, 1).fill = base_fill
+
+        # UEN cell: script highlight takes priority over alternating row colour
+        uen_cell = ws.cell(excel_rn, 2)
+        uen_cell.font = uf
+        if orig_i in script_rows:
+            uen_cell.fill = FILL_FILLED if script_rows[orig_i] == "filled" else FILL_REPLACED
+        else:
+            uen_cell.fill = base_fill
+
+        ws.row_dimensions[excel_rn].height = 18
+
     for col_cells in ws.columns:
         cl = get_column_letter(col_cells[0].column)
         ws.column_dimensions[cl].width = min(
@@ -592,12 +604,13 @@ st.markdown('<div class="card-bot">', unsafe_allow_html=True)
 
 if st.button("▶  Run UEN Autofill", use_container_width=True):
     with st.spinner("Looking up UENs…"):
-        processed_df, stats = process_df(
+        processed_df, stats, script_rows = process_df(
             raw_df, name_col_idx, uen_col_idx,
             header_row_idx, int(end_row_input),
             exact, fw_index, alias_exact, fts_conns)
     st.session_state["processed_df"]    = processed_df
     st.session_state["stats"]           = stats
+    st.session_state["script_rows"]     = script_rows
     st.session_state["preview_two_col"] = True
     st.success("Done!")
 
@@ -613,6 +626,17 @@ if "processed_df" in st.session_state:
     </div>
     """, unsafe_allow_html=True)
 
+    # ── Highlight legend ──────────────────────────────────────────────────────
+    st.markdown("""
+    <div class="legend-row">
+      <span class="legend-chip legend-filled">🟡 Filled by script &nbsp;—&nbsp; UEN was empty</span>
+      <span class="legend-chip legend-replaced">🟠 Replaced by script &nbsp;—&nbsp; UEN was invalid or name was pasted</span>
+    </div>
+    <p style="font-size:0.78rem;color:#9A9A9A;margin:0.2rem 0 0 0;">
+      These cell colours appear in both Excel downloads so you can quickly review what the script changed.
+    </p>
+    """, unsafe_allow_html=True)
+
     st.markdown("<div style='height:1rem'></div>", unsafe_allow_html=True)
     out_name = Path(uploaded_file.name).stem + "_processed"
 
@@ -622,7 +646,10 @@ if "processed_df" in st.session_state:
     with dl1:
         st.markdown("**Full sheet** *(original columns + UEN filled)*")
         st.download_button("⬇  Excel (.xlsx)",
-            build_full_excel(st.session_state["processed_df"]),
+            build_full_excel(
+                st.session_state["processed_df"],
+                uen_col_idx,
+                st.session_state["script_rows"]),
             file_name=out_name+".xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             use_container_width=True)
@@ -636,7 +663,8 @@ if "processed_df" in st.session_state:
         st.download_button("⬇  UEN Results (.xlsx)",
             build_uen_only_excel(
                 st.session_state["processed_df"],
-                name_col_idx, uen_col_idx, header_row_idx),
+                name_col_idx, uen_col_idx, header_row_idx,
+                st.session_state["script_rows"]),
             file_name=out_name+"_uen_only.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             use_container_width=True)
@@ -663,7 +691,22 @@ if "processed_df" in st.session_state:
             sliced = sliced.iloc[1:].copy()
             sliced.columns = new_cols
             sliced.index = range(len(sliced))
-            st.dataframe(sliced, width='stretch', height=400)
+
+            # Highlight script-written rows in the Streamlit preview too
+            script_rows_preview = st.session_state["script_rows"]
+            uen_col_name = new_cols[1]
+
+            def highlight_script_rows(row):
+                orig_i = row.name + header_row_idx + 1   # map back to original df index
+                if orig_i in script_rows_preview:
+                    kind = script_rows_preview[orig_i]
+                    colour = "#FFF3CD" if kind == "filled" else "#FFE0D0"
+                    return ["", f"background-color:{colour}"]
+                return ["", ""]
+
+            st.dataframe(
+                sliced.style.apply(highlight_script_rows, axis=1),
+                width='stretch', height=400)
         else:
             full = out_df.iloc[header_row_idx:].copy()
             hv = [str(v) if str(v) not in ("","nan","None") else f"Col {col_index_to_letter(i)}"
