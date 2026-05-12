@@ -76,6 +76,9 @@ DB_PATHS = [
     "./database_4.db",
 ]
 
+# Path to the curated override Excel file (place alongside app.py)
+OVERRIDE_XLSX = "./company_uen_data.xlsx"
+
 # Highlight fill colours applied to script-written UEN cells
 FILL_FILLED   = PatternFill("solid", fgColor="FFF3CD")   # amber-yellow  — was empty, now filled
 FILL_REPLACED = PatternFill("solid", fgColor="FFE0D0")   # soft coral    — was invalid/wrong, now replaced
@@ -121,6 +124,54 @@ def clean_val(v) -> str:
 def clear_session_data():
     for key in ["processed_df","stats","script_rows","preview_two_col"]:
         st.session_state.pop(key, None)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  OVERRIDE DICTIONARY  (company_uen_data.xlsx)
+# ═══════════════════════════════════════════════════════════════════════════════
+@st.cache_resource(show_spinner="Loading override dictionary…")
+def load_override_dict(xlsx_path: str) -> dict:
+    """
+    Returns a dict mapping every normalised name/alias → UEN (uppercase).
+    Covers:
+      • CompanyName column (exact + normalised)
+      • Every comma-separated entry in the Aliases column
+    This dict is checked FIRST in find_uen(), before any DB lookup.
+    """
+    override: dict[str, str] = {}
+    if not os.path.exists(xlsx_path):
+        return override
+
+    try:
+        df = pd.read_excel(xlsx_path, dtype=str).fillna("")
+    except Exception:
+        return override
+
+    for _, row in df.iterrows():
+        raw_name  = str(row.get("CompanyName", "")).strip()
+        raw_uen   = str(row.get("UEN", "")).strip().upper()
+        raw_alias = str(row.get("Aliases", "")).strip()
+
+        if not raw_uen:
+            continue
+
+        # Register the full company name
+        if raw_name:
+            norm = normalise(raw_name)
+            if norm:
+                override[norm] = raw_uen
+
+        # Register every alias (comma-separated)
+        if raw_alias:
+            for part in raw_alias.split(","):
+                part = part.strip()
+                if not part:
+                    continue
+                norm_alias = normalise(part)
+                if norm_alias and norm_alias not in override:
+                    override[norm_alias] = raw_uen
+
+    return override
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -247,21 +298,111 @@ def fts_lookup(norm_query: str, fts_conns: list) -> str:
     return ""
 
 
+# ─── SCORING HELPERS ──────────────────────────────────────────────────────────
+def score_candidate(norm_query: str, norm_name: str) -> float:
+    """
+    Improved scoring that combines:
+      1. Substring containment with a length-ratio penalty (Option 2):
+         penalises candidates significantly longer than the query, and requires
+         that the query explains most of the candidate's tokens — preventing
+         "PM Group" from matching "RPM GROUP" or "NUS" from matching a tea shop.
+      2. Token-coverage ratio (Option 3):
+         what fraction of the candidate's meaningful tokens appear in the query,
+         used as a tiebreaker so "the learning point" scores higher than
+         "ark learning point" for the query "Learning Point".
+
+    Returns a float score (higher = better), or -1 if no meaningful match.
+
+    Scoring tiers:
+      7000+ : both query and candidate tokens are mutually well-covered (≥ 80 %)
+              AND length ratio ≥ 0.35  — catches "singapore cancer society" etc.
+      5000+ : substring containment, length ratio > 0.55, token coverage ≥ 0.6
+              — tiebreaker uses token_coverage so the tighter match wins
+      3000+ : moderate token coverage (≥ 0.6 / 0.5) with length ratio ≥ 0.35
+      -1    : no useful match
+    """
+    nq_len = len(norm_query)
+    nc_len = len(norm_name)
+    if nc_len == 0:
+        return -1
+
+    # ── Length ratio (shorter / longer) ──────────────────────────────────────
+    length_ratio = min(nq_len, nc_len) / max(nq_len, nc_len)
+
+    # ── Token coverage ────────────────────────────────────────────────────────
+    q_tokens      = set(meaningful_tokens(norm_query))
+    c_tokens      = meaningful_tokens(norm_name)
+    if not c_tokens:
+        return -1
+    token_coverage = sum(1 for t in c_tokens if t in q_tokens) / len(c_tokens)
+
+    q_tokens_list  = meaningful_tokens(norm_query)
+    query_coverage = (sum(1 for t in q_tokens_list if t in set(c_tokens)) / len(q_tokens_list)
+                      if q_tokens_list else 0)
+
+    # ── Substring containment flag ────────────────────────────────────────────
+    is_substr = (norm_query in norm_name) if nq_len <= nc_len else (norm_name in norm_query)
+
+    # ── Tier 1: substring containment ────────────────────────────────────────
+    # length_ratio > 0.55  → avoids "NUS" (3) matching a 30-char name containing NUS
+    # token_coverage ≥ 0.6 → avoids "PM Group" matching "RPM GROUP"
+    #                         (only 1 of 2 RPM-GROUP tokens covered by query)
+    # token_coverage used as tiebreaker so "the learning point" beats "ark learning point"
+    if is_substr and length_ratio > 0.55 and token_coverage >= 0.6:
+        return 5000 + min(nq_len, nc_len) + token_coverage * 10
+
+    # ── Tier 2: high mutual token coverage ───────────────────────────────────
+    if token_coverage >= 0.8 and query_coverage >= 0.8 and length_ratio >= 0.35:
+        return 7000 + token_coverage * 100
+
+    # ── Tier 3: moderate token coverage ──────────────────────────────────────
+    if token_coverage >= 0.6 and query_coverage >= 0.5 and length_ratio >= 0.35:
+        return 3000 + token_coverage * 100
+
+    return -1
+
+
 # ─── FIND UEN ─────────────────────────────────────────────────────────────────
 def find_uen(typed_name: str,
+             override: dict,
              exact: dict, fw_index: dict, alias_exact: dict,
              fts_conns: list) -> str:
-
+    """
+    Lookup order:
+      1. Override dict (company_uen_data.xlsx) — exact normalised match
+      2. Override dict — alias match
+      3. DB exact match
+      4. DB alias exact match
+      5. DB fw_index scored match (improved scoring)
+      6. FTS5 full-text search
+    """
     norm_query = normalise(typed_name)
     if not norm_query:
         return ""
 
+    # ── 1. Override: exact name match ─────────────────────────────────────────
+    if norm_query in override:
+        return override[norm_query]
+
+    # ── 2. Override: partial / token match against override keys ─────────────
+    # Walk override keys looking for a good score — override is small (~500 rows)
+    best_ov_uen, best_ov_score = "", -1
+    for ov_norm, ov_uen in override.items():
+        sc = score_candidate(norm_query, ov_norm)
+        if sc > best_ov_score:
+            best_ov_score, best_ov_uen = sc, ov_uen
+    if best_ov_score >= 5000:
+        return best_ov_uen
+
+    # ── 3. DB exact match ────────────────────────────────────────────────────
     if norm_query in exact:
         return exact[norm_query]
 
+    # ── 4. DB alias exact match ──────────────────────────────────────────────
     if norm_query in alias_exact:
         return alias_exact[norm_query]
 
+    # ── 5. DB fw_index scored match ───────────────────────────────────────────
     nq_len = len(norm_query)
     best_uen, best_score = "", -1
 
@@ -274,43 +415,31 @@ def find_uen(typed_name: str,
                     seen_cands[nn] = entry
 
     for norm_name, uen, alias_norms in seen_cands.values():
-        en_len = len(norm_name)
+        # Score against the canonical name
+        sc = score_candidate(norm_query, norm_name)
+        if sc > best_score:
+            best_score, best_uen = sc, uen
 
-        if nq_len <= en_len:
-            sl, ratio, hit = nq_len, nq_len / en_len, norm_query in norm_name
-        else:
-            sl, ratio, hit = en_len, en_len / nq_len, norm_name in norm_query
-        if hit and ratio >= 0.5:
-            score = 5000 + sl
-            if score > best_score:
-                best_score, best_uen = score, uen
-            continue
-
+        # Score against each alias stored in the DB
         for alias in alias_norms:
-            al_len = len(alias)
-            if nq_len <= al_len:
-                asl, ar, ah = nq_len, nq_len / al_len if al_len else 0, norm_query in alias
-            else:
-                asl, ar, ah = al_len, al_len / nq_len if nq_len else 0, alias in norm_query
-            if ah and ar >= 0.5:
-                score = 4000 + asl
-                if score > best_score:
-                    best_score, best_uen = score, uen
-                break
+            asc = score_candidate(norm_query, alias)
+            if asc > best_score:
+                best_score, best_uen = asc, uen
 
-    if best_score >= 4000:
+    if best_score >= 5000:
         return best_uen
 
+    # ── 6. FTS5 fallback ──────────────────────────────────────────────────────
     fts_result = fts_lookup(norm_query, fts_conns)
     if fts_result:
         return fts_result
 
-    return best_uen if best_score >= 0 else ""
+    return best_uen if best_score >= 3000 else ""
 
 
 # ─── PROCESS ──────────────────────────────────────────────────────────────────
 def process_df(df, name_col_idx, uen_col_idx, header_row_idx, end_row_1based,
-               exact, fw_index, alias_exact, fts_conns):
+               override, exact, fw_index, alias_exact, fts_conns):
 
     result_df  = df.copy()
     filled = replaced = already = na_count = no_match = 0
@@ -328,7 +457,7 @@ def process_df(df, name_col_idx, uen_col_idx, header_row_idx, end_row_1based,
     def cached_find(name: str) -> str:
         key = normalise(name)
         if key not in _lookup_cache:
-            _lookup_cache[key] = find_uen(name, exact, fw_index, alias_exact, fts_conns)
+            _lookup_cache[key] = find_uen(name, override, exact, fw_index, alias_exact, fts_conns)
         return _lookup_cache[key]
 
     for i in range(data_start, min(data_end + 1, len(df))):
@@ -507,6 +636,17 @@ if len(missing) == len(DB_PATHS):
                 unsafe_allow_html=True)
     st.stop()
 
+# ── Load override dict first (cheap, cached) ──────────────────────────────────
+override = load_override_dict(OVERRIDE_XLSX)
+override_status = (
+    f"✅ Override dictionary loaded — <strong>{len(override):,}</strong> entries "
+    f"from <code>company_uen_data.xlsx</code>"
+    if override
+    else "⚠️ Override file not found — place <code>company_uen_data.xlsx</code> in the app root."
+)
+st.markdown(f'<div class="info-box">{override_status}</div>', unsafe_allow_html=True)
+st.markdown("<div style='height:0.4rem'></div>", unsafe_allow_html=True)
+
 exact, fw_index, alias_exact, fts_conns, total_records = build_indexes(tuple(DB_PATHS))
 st.markdown(f'<div class="info-box">✅ Reference database loaded — '
             f'<strong>{total_records:,}</strong> company records</div>',
@@ -607,7 +747,7 @@ if st.button("▶  Run UEN Autofill", use_container_width=True):
         processed_df, stats, script_rows = process_df(
             raw_df, name_col_idx, uen_col_idx,
             header_row_idx, int(end_row_input),
-            exact, fw_index, alias_exact, fts_conns)
+            override, exact, fw_index, alias_exact, fts_conns)
     st.session_state["processed_df"]    = processed_df
     st.session_state["stats"]           = stats
     st.session_state["script_rows"]     = script_rows
